@@ -1,0 +1,184 @@
+name: Build Kernel for Xiaomi Munch (Official Source)
+
+on:
+  workflow_dispatch: # Cho phép chạy workflow thủ công
+  push:
+    branches:
+      - munch-s-oss # Đảm bảo chạy trên nhánh kernel source mới của bạn
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # Sử dụng máy ảo Ubuntu mới nhất
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }} # Checkout chính repo hiện tại của bạn
+          ref: munch-s-oss                   # Đảm bảo checkout đúng nhánh kernel source
+          submodules: true                   # Đảm bảo tải cả submodule nếu có
+
+      - name: Full Build Process
+        run: |
+          echo "Bắt đầu quá trình build kernel cho Xiaomi Munch..."
+
+          # Bước 1: Thiết lập môi trường build và cài đặt phụ thuộc
+          echo "Thiết lập môi trường build và cài đặt phụ thuộc..."
+          sudo apt update
+          sudo apt install -y git wget zip unzip make flex bison libssl-dev libelf-dev bc cpio build-essential zstd lz4 xz-utils coreutils procps || { echo "Lỗi: Không thể cài đặt các gói phụ thuộc."; exit 1; }
+
+          # Bước 2: Clone Clang Toolchain (Provasishh)
+          echo "Cloning Clang toolchain từ GitLab (Provasishh)..."
+          mkdir -p tc/clang_repo 
+          mkdir -p tc/clang      
+          
+          git clone --depth=1 https://gitlab.com/provasishh/clang.git tc/clang_repo || { echo "Lỗi: Không thể clone Clang toolchain."; exit 1; }
+          
+          echo "Kiểm tra nội dung của tc/clang_repo trước khi di chuyển:"
+          ls -F tc/clang_repo/ 
+
+          if [ -d "tc/clang_repo/clang" ]; then
+              shopt -s dotglob # Bật globbing cho các file ẩn
+              mv tc/clang_repo/clang/* tc/clang/ || { echo "Lỗi: Không thể di chuyển nội dung tc/clang_repo/clang/ vào tc/clang/."; exit 1; }
+              shopt -u dotglob # Tắt globbing
+          else
+              echo "Lỗi: Thư mục 'clang/' không tìm thấy trong tc/clang_repo. Cấu trúc repo không như mong đợi."
+              exit 1
+          fi
+          
+          if [ -d "tc/clang_repo/aarch64-linux-android-4.9" ]; then
+              mv tc/clang_repo/aarch64-linux-android-4.9 tc/aarch64-linux-android-4.9 || { echo "Lỗi: Không thể di chuyển GCC cũ."; exit 1; }
+          fi
+
+          rm -rf tc/clang_repo 
+
+          echo "Nội dung của ${GITHUB_WORKSPACE}/tc/clang/bin sau khi di chuyển:"
+          ls -F "${GITHUB_WORKSPACE}/tc/clang/bin/" 
+          
+          if [ ! -f "${GITHUB_WORKSPACE}/tc/clang/bin/clang" ]; then
+              echo "Lỗi: Clang executable không tìm thấy tại ${GITHUB_WORKSPACE}/tc/clang/bin/clang"
+              echo "Cấu trúc thư mục tc/clang tổng thể:"
+              ls -R "${GITHUB_WORKSPACE}/tc/clang/" 
+              exit 1
+          fi
+          
+          if [ ! -x "${GITHUB_WORKSPACE}/tc/clang/bin/clang" ]; then
+              echo "Lỗi: Clang executable không có quyền thực thi tại ${GITHUB_WORKSPACE}/tc/clang/bin/clang"
+              chmod +x "${GITHUB_WORKSPACE}/tc/clang/bin/clang" || { echo "Lỗi: Không thể cấp quyền thực thi cho clang."; exit 1; }
+              echo "Đã cấp quyền thực thi cho clang."
+          fi
+          
+          echo "Clang toolchain đã sẵn sàng."
+
+          # Bước 3: Áp dụng bản vá SukiSU-Ultra và susfs
+          echo "Áp dụng bản vá SukiSU-Ultra và susfs..."
+          # Với kernel source chính thức của Xiaomi, đường dẫn KernelSU/SUSFS có thể cần được áp dụng trực tiếp
+          # vào thư mục gốc của kernel.
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main || { echo "Lỗi: Áp dụng bản vá SukiSU-Ultra thất bại."; exit 1; }
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev || { echo "Lỗi: Áp dụng bản vá susfs-dev thất bại."; exit 1; }
+          echo "Đã vá kernel."
+
+          # Bước 4: Clone AnyKernel3
+          echo "Cloning AnyKernel3..."
+          git clone https://github.com/yassshhhh15/AnyKernel3.git --depth=1 anykernel || { echo "Lỗi: Không thể clone AnyKernel."; exit 1; }
+
+          # Bước 5: Build và đóng gói Kernel
+          echo "Bắt đầu biên dịch và đóng gói kernel..."
+
+          # Cài đặt biến môi trường cho quá trình build trong cùng shell này
+          export KERNEL_SRC="${GITHUB_WORKSPACE}" 
+          export KERNEL_OUT="${GITHUB_WORKSPACE}/out"
+          # Đảm bảo PATH trỏ đúng đến thư mục bin của toolchain
+          export PATH="${GITHUB_WORKSPACE}/tc/clang/bin:${PATH}"
+          
+          DT=$(date +"%Y%m%d-%HM")
+          # Sử dụng defconfig mới cho munch
+          CONFIG_FILE="arch/arm64/configs/munch_defconfig" 
+
+          # Cấu hình lại các biến để sử dụng Clang/LLVM
+          export KERNEL_ARCH=arm64
+          export CLANG_TRIPLE="aarch64-linux-gnu-" 
+          export CROSS_COMPILE="aarch64-linux-gnu-" # Để make tìm clang/binutils trong PATH
+
+          # Export các biến này để Make sử dụng các công cụ LLVM
+          export CC="clang" 
+          export LD="ld.lld" 
+          export AR="llvm-ar"
+          export NM="llvm-nm"
+          export OBJCOPY="llvm-objcopy" 
+          export OBJDUMP="llvm-objdump" 
+          export STRIP="llvm-strip" 
+
+          # Cấu hình HOST tools để cũng sử dụng Clang/LLVM
+          export HOSTCC="clang"
+          export HOSTAR="llvm-ar"
+          export HOSTLD="ld.lld"
+          export HOSTAS="clang"
+          export HOSTCXX="clang++"
+          
+          # Thêm các cờ đặc biệt nếu cần cho kernel Xiaomi
+          # Ví dụ: LLVM=1 LLVM_IAS=1 có thể đã được xử lý bởi các biến export trên
+          # nhưng có thể cần thêm các cờ khác tùy thuộc vào kernel
+          COMMON_MAKE_FLAGS="ARCH=${KERNEL_ARCH} CROSS_COMPILE=${CROSS_COMPILE} KCFLAGS=-Wno-array-bounds"
+
+          echo "Dọn dẹp bản build cũ..."
+          make O="${KERNEL_OUT}" ${COMMON_MAKE_FLAGS} mrproper || { echo "Lỗi: make mrproper thất bại."; exit 1; }
+
+          echo "Tạo cấu hình ${CONFIG_FILE}..."
+          make O="${KERNEL_OUT}" ${COMMON_MAKE_FLAGS} "${CONFIG_FILE}" || { echo "Lỗi: Tạo cấu hình defconfig thất bại."; exit 1; }
+
+          echo "Bắt đầu biên dịch kernel..."
+          make -j$(nproc --all) O="${KERNEL_OUT}" ${COMMON_MAKE_FLAGS} 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+              echo "Lỗi: Biên dịch kernel thất bại. Kiểm tra build.log để biết chi tiết."
+              exit 1
+          fi
+          echo "Biên dịch kernel hoàn tất."
+
+          echo "Đang đóng gói kernel thành file ZIP..."
+          
+          IMAGE_PATH="${KERNEL_OUT}/arch/${KERNEL_ARCH}/boot/Image"
+          # Kernel source chính thức có thể không tạo dtbo.img hoặc dtb ở đây, kiểm tra lại cấu trúc output
+          DTBO_PATH="${KERNEL_OUT}/arch/${KERNEL_ARCH}/boot/dtbo.img"
+          DTB_PATH="${KERNEL_OUT}/arch/${KERNEL_ARCH}/boot/dts/qcom/sm8350-v2-overlay.dtb" # Ví dụ đường dẫn DTB phổ biến cho SM8350
+
+          if [ ! -f "${IMAGE_PATH}" ]; then
+              echo "Lỗi: Không tìm thấy Image kernel tại ${IMAGE_PATH}."
+              exit 1
+          fi
+
+          cd anykernel || { echo "Lỗi: Không vào được thư mục anykernel."; exit 1; }
+          rm -f *.zip 
+
+          cp "${IMAGE_PATH}" .
+          [ -f "${DTBO_PATH}" ] && cp "${DTBO_PATH}" .
+          [ -f "${DTB_PATH}" ] && cp "${DTB_PATH}" .
+
+          zip_filename="Aurora-Munch-${DT}.zip" # Đổi tên file ZIP theo thiết bị mới
+          echo "Tạo file: ${zip_filename}"
+          zip -r9 "${zip_filename}" * -x ".git/*" -x "README.md" || { echo "Lỗi: Tạo file ZIP thất bại."; exit 1; }
+          
+          echo "Đã tạo file: $(pwd)/${zip_filename}"
+          
+          rm -f Image dtbo.img dtb
+
+          cd "${GITHUB_WORKSPACE}" 
+        
+      - name: Upload Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-zip
+          path: anykernel/*.zip 
+          retention-days: 7 
+          
+      - name: Clean up compiled images
+        run: |
+          echo "Đang xóa các ảnh đã biên dịch khỏi thư mục out..."
+          local BOOT_DIR="${KERNEL_OUT}/arch/${KERNEL_ARCH}/boot"
+          if [ -d "${BOOT_DIR}" ]; then
+              rm -f "${BOOT_DIR}/Image" "${BOOT_DIR}/dtbo.img" "${BOOT_DIR}/dtb"
+              echo "Đã xóa Image, dtbo.img, dtb từ ${BOOT_DIR}."
+          else
+              echo "Cảnh báo: Thư mục boot không tồn tại: ${BOOT_DIR}."
+          fi
